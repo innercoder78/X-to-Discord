@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# X-to-Discord monitor sensitive/local files
+.env.*
+*.tw_session
+*.session
+cookies*
+*.cookie
+.DS_Store
+.vscode/
+.idea/
