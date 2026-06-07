@@ -13,6 +13,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import math
 
 SUCCESS_LINE = "Monitor completed"
 FAILURE_LINE = "Monitor failed"
@@ -21,8 +22,10 @@ CURSOR_SECRET_NAME = "X_POST_ID"
 X_EPOCH_MS = 1288834974657
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_@.])@([A-Za-z0-9_]{1,15})(?![A-Za-z0-9_])")
+MAX_TIMELINE_PAGES = 5
 DISCORD_RETRY_STATUSES = {429, 500, 502, 503, 504}
-MEANINGLESS_VALUES = {None, "", 0, "0"}
+MIN_RETRY_DELAY = 0.1
+MAX_RETRY_DELAY = 60.0
 
 
 class MonitorError(Exception):
@@ -40,6 +43,7 @@ class Config:
     discord_webhook: str
     cursor: int
     repository: str
+    gh_token: str
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,14 @@ class PostRecord:
 @dataclass(frozen=True)
 class FilterResult:
     qualifies: bool
+
+
+@dataclass(frozen=True)
+class TimelineResult:
+    records: list[PostRecord]
+    pages_retrieved: int
+    more_pages: bool
+    found_cursor_boundary: bool
 
 
 def harden_process_output() -> None:
@@ -116,18 +128,22 @@ def parse_cursor(value: str | None) -> int:
 
 def load_config() -> Config:
     source_token = os.getenv("X_SOURCE_TOKEN")
-    if not source_token:
+    if not isinstance(source_token, str) or not source_token.strip():
+        raise ConfigError()
+    gh_token = os.getenv("GH_TOKEN")
+    if not isinstance(gh_token, str) or not gh_token.strip():
         raise ConfigError()
     webhook = validate_webhook(os.getenv("DISCORD_WEBHOOK", ""))
     repository = os.getenv("GITHUB_REPOSITORY")
     if not repository or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ConfigError()
     return Config(
-        source_token=source_token,
+        source_token=source_token.strip(),
         monitored_account=normalize_username(os.getenv("X_MONITORED_ACCOUNT", "")),
         discord_webhook=webhook,
         cursor=parse_cursor(os.getenv("X_POST_ID")),
         repository=repository,
+        gh_token=gh_token.strip(),
     )
 
 
@@ -213,46 +229,59 @@ def original_dict(tweet: Any) -> dict[str, Any] | None:
 
 
 def meaningful(value: Any) -> bool:
-    return value not in MEANINGLESS_VALUES
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() not in {"", "0"}
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, (dict, list, tuple, set, frozenset)):
+        return len(value) > 0
+    return True
+
+
+def bool_attr(tweet: Any, name: str) -> bool | None:
+    value = getattr(tweet, name, None)
+    return value if isinstance(value, bool) else None
 
 
 def determine_reply(tweet: Any) -> bool | None:
     original = original_dict(tweet)
+    keys = ("in_reply_to_status_id_str", "in_reply_to_user_id_str", "in_reply_to_screen_name")
     if original is not None:
-        keys = ("in_reply_to_status_id_str", "in_reply_to_user_id_str", "in_reply_to_screen_name")
-        return any(meaningful(original.get(key)) for key in keys)
-    value = getattr(tweet, "is_reply", None)
-    return value if isinstance(value, bool) else None
+        present = [key for key in keys if key in original]
+        if present:
+            return any(meaningful(original.get(key)) for key in present)
+    return bool_attr(tweet, "is_reply")
 
 
 def determine_quote(tweet: Any) -> bool | None:
     original = original_dict(tweet)
     if original is not None:
         quote_flag = original.get("is_quote_status")
-        if isinstance(quote_flag, bool) and quote_flag:
+        if quote_flag is True:
             return True
-        for key in ("quoted_status", "quoted_status_result", "quoted_status_id_str", "quoted_status_permalink"):
-            if meaningful(original.get(key)):
-                return True
-        if isinstance(quote_flag, bool):
+        quoted_populated = any(
+            meaningful(original.get(key))
+            for key in ("quoted_status", "quoted_status_result", "quoted_status_id_str", "quoted_status_permalink")
+        )
+        if quoted_populated:
+            return True
+        if quote_flag is False:
             return False
-    value = getattr(tweet, "is_quoted", None)
-    return value if isinstance(value, bool) else None
+    return bool_attr(tweet, "is_quoted")
 
 
 def determine_repost(tweet: Any) -> bool | None:
     original = original_dict(tweet)
-    value = getattr(tweet, "is_retweet", None)
-    if isinstance(value, bool) and value:
-        return True
     if original is not None:
         for key in ("retweeted_status", "retweeted_status_result", "retweeted_status_id_str"):
             if meaningful(original.get(key)):
                 return True
-        if isinstance(value, bool):
-            return value
         return False
-    return value if isinstance(value, bool) else None
+    return bool_attr(tweet, "is_retweet")
 
 
 def get_text(tweet: Any) -> str | None:
@@ -302,24 +331,7 @@ def qualifies(tweet: Any) -> FilterResult:
     return FilterResult(not reply and not quote and not repost and not mentions)
 
 
-def validate_post_url(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    parsed = urlsplit(value)
-    if parsed.scheme != "https" or parsed.hostname not in {"x.com", "twitter.com"}:
-        return None
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) >= 3 and parts[1] == "status" and parse_positive_decimal(parts[2]) is not None:
-        return value
-    return None
-
-
 def post_url(tweet: Any, monitored_handle: str, post_id: int) -> str:
-    for field in ("url", "tweet_url", "link"):
-        value = validate_post_url(getattr(tweet, field, None))
-        if value:
-            add_mask(value)
-            return value
     constructed = f"https://x.com/{monitored_handle}/status/{post_id}"
     add_mask(constructed)
     return constructed
@@ -382,10 +394,68 @@ async def authenticate(source_token: str) -> Any:
     raise MonitorError() if last_app is None else MonitorError()
 
 
-async def retrieve_timeline(app: Any, monitored_account: str) -> Any:
+def split_iter_page(page: Any) -> tuple[Any, Any]:
+    if isinstance(page, tuple) and len(page) == 2:
+        first, second = page
+        if isinstance(first, (list, tuple)) and not isinstance(second, (list, tuple)):
+            return second, first
+        return first, second
+    return None, page
+
+
+def page_has_more(page_state: Any) -> bool:
+    for name in ("has_next_page", "has_next", "has_more", "more", "next_cursor"):
+        value = getattr(page_state, name, None)
+        if isinstance(value, bool):
+            return value
+        if meaningful(value):
+            return True
+    if isinstance(page_state, dict):
+        for name in ("has_next_page", "has_next", "has_more", "more", "next_cursor"):
+            value = page_state.get(name)
+            if isinstance(value, bool):
+                return value
+            if meaningful(value):
+                return True
+    return False
+
+
+async def retrieve_timeline_once(app: Any, monitored_account: str, cursor: int) -> TimelineResult:
+    pages_limit = 1 if cursor == 0 else MAX_TIMELINE_PAGES
+    records: dict[int, PostRecord] = {}
+    pages_retrieved = 0
+    more_pages = False
+    found_cursor_boundary = False
+
+    async for page in app.iter_tweets(monitored_account, pages=pages_limit, replies=True, wait_time=1):
+        pages_retrieved += 1
+        page_state, page_items = split_iter_page(page)
+        more_pages = page_has_more(page_state)
+        page_records = build_records(page_items, monitored_account)
+        for record in page_records:
+            records.setdefault(record.post_id, record)
+            if cursor > 0 and record.post_id <= cursor:
+                found_cursor_boundary = True
+        if cursor > 0 and (found_cursor_boundary or not more_pages or pages_retrieved >= MAX_TIMELINE_PAGES):
+            break
+        if cursor == 0:
+            break
+
+    sorted_records = sorted(records.values(), key=lambda record: record.post_id)
+    if (
+        cursor > 0
+        and pages_retrieved >= MAX_TIMELINE_PAGES
+        and more_pages
+        and all(record.post_id > cursor for record in sorted_records)
+    ):
+        raise MonitorError()
+    return TimelineResult(sorted_records, pages_retrieved, more_pages, found_cursor_boundary)
+
+
+async def retrieve_timeline(app: Any, monitored_account: str, cursor: int) -> TimelineResult:
     for attempt in range(3):
         try:
-            return await app.get_tweets(monitored_account, pages=2, replies=True, wait_time=1)
+            return await retrieve_timeline_once(app, monitored_account, cursor)
         except Exception as exc:
             if attempt == 2:
                 raise MonitorError() from exc
@@ -486,6 +556,33 @@ def discord_payload(record: PostRecord) -> dict[str, Any]:
     return payload
 
 
+def safe_retry_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def clamp_retry_delay(value: float) -> float:
+    return min(MAX_RETRY_DELAY, max(MIN_RETRY_DELAY, value))
+
+
+def discord_retry_delay(response: Any, fallback_delay: float) -> float:
+    retry_after = None
+    with contextlib.suppress(Exception):
+        data = response.json()
+        if isinstance(data, dict):
+            retry_after = safe_retry_number(data.get("retry_after"))
+    if retry_after is None:
+        retry_after = safe_retry_number(response.headers.get("Retry-After"))
+    if retry_after is None:
+        retry_after = fallback_delay
+    return clamp_retry_delay(retry_after)
+
+
 async def deliver_discord(webhook: str, payload: dict[str, Any]) -> None:
     import httpx
 
@@ -494,32 +591,28 @@ async def deliver_discord(webhook: str, payload: dict[str, Any]) -> None:
         for attempt in range(4):
             try:
                 response = await client.post(webhook, json=payload)
-            except (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.PoolTimeout, httpx.TimeoutException) as exc:
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempt == 3:
                     raise MonitorError() from exc
                 await asyncio.sleep(2**attempt)
                 continue
             if 200 <= response.status_code < 300:
                 return
-            if response.status_code == 429 or response.status_code in DISCORD_RETRY_STATUSES:
+            if response.status_code in DISCORD_RETRY_STATUSES:
                 if attempt == 3:
                     raise MonitorError()
-                retry_after = None
-                with contextlib.suppress(Exception):
-                    data = response.json()
-                    if isinstance(data, dict):
-                        retry_after = float(data.get("retry_after"))
-                await asyncio.sleep(min(60.0, retry_after if retry_after is not None else float(2**attempt)))
+                await asyncio.sleep(discord_retry_delay(response, float(2**attempt)))
                 continue
             raise MonitorError()
     # A timeout after Discord accepts a message may be retried and duplicate the notification.
     raise MonitorError()
 
 
-def update_cursor_secret(post_id: int, repository: str) -> None:
+def update_cursor_secret(post_id: int, repository: str, gh_token: str) -> None:
     env = os.environ.copy()
     env["GH_PROMPT_DISABLED"] = "1"
     env["NO_COLOR"] = "1"
+    env["GH_TOKEN"] = gh_token
     command = ["gh", "secret", "set", CURSOR_SECRET_NAME, "--env", ENVIRONMENT_NAME, "--repo", repository]
     completed = subprocess.run(
         command,
@@ -538,19 +631,19 @@ def update_cursor_secret(post_id: int, repository: str) -> None:
 async def process(config: Config) -> None:
     app = await authenticate(config.source_token)
     try:
-        timeline = await retrieve_timeline(app, config.monitored_account)
-        records = build_records(timeline, config.monitored_account)
+        timeline = await retrieve_timeline(app, config.monitored_account, config.cursor)
+        records = timeline.records
         if config.cursor == 0:
             new_cursor = max((record.post_id for record in records), default=None)
             if new_cursor is None:
                 new_cursor = current_snowflake_boundary()
-            update_cursor_secret(new_cursor, config.repository)
+            update_cursor_secret(new_cursor, config.repository, config.gh_token)
             return
         cursor = config.cursor
-        for record in sorted((r for r in records if r.post_id > cursor), key=lambda r: r.post_id):
+        for record in (record for record in records if record.post_id > cursor):
             if qualifies(record.tweet).qualifies:
                 await deliver_discord(config.discord_webhook, discord_payload(record))
-            update_cursor_secret(record.post_id, config.repository)
+            update_cursor_secret(record.post_id, config.repository, config.gh_token)
             cursor = record.post_id
     finally:
         await close_tweety_client(app)
@@ -562,7 +655,7 @@ async def async_main() -> None:
     add_mask(config.source_token)
     add_mask(config.monitored_account)
     add_mask(config.discord_webhook)
-    add_mask(os.getenv("GH_TOKEN", ""))
+    add_mask(config.gh_token)
     await process(config)
 
 
