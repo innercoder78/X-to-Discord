@@ -19,6 +19,11 @@ SUCCESS_LINE = "Monitor completed"
 FAILURE_LINE = "Monitor failed"
 ENVIRONMENT_NAME = "monitor-state"
 CURSOR_SECRET_NAME = "X_POST_ID"
+AUTH_ALERT_SECRET_NAME = "X_AUTH_ALERT_SENT"
+AUTH_ALERT_MESSAGE = (
+    "X to Discord has stopped because the X session could not be authenticated. "
+    "Re-authenticate the session to resume mirroring posts."
+)
 X_EPOCH_MS = 1288834974657
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_@.])@([A-Za-z0-9_]{1,15})(?![A-Za-z0-9_])")
@@ -36,6 +41,10 @@ class ConfigError(MonitorError):
     """Configuration is missing or invalid."""
 
 
+class AuthenticationError(MonitorError):
+    """X authentication failed after retry attempts were exhausted."""
+
+
 @dataclass(frozen=True)
 class Config:
     source_token: str
@@ -44,6 +53,7 @@ class Config:
     cursor: int
     repository: str
     gh_token: str
+    auth_alert_sent: str
 
 
 @dataclass(frozen=True)
@@ -126,6 +136,12 @@ def parse_cursor(value: str | None) -> int:
     return int(text)
 
 
+def parse_auth_alert_state(value: str | None) -> str:
+    if value not in {"0", "1"}:
+        raise ConfigError()
+    return value
+
+
 def load_config() -> Config:
     source_token = os.getenv("X_SOURCE_TOKEN")
     if not isinstance(source_token, str) or not source_token.strip():
@@ -144,6 +160,7 @@ def load_config() -> Config:
         cursor=parse_cursor(os.getenv("X_POST_ID")),
         repository=repository,
         gh_token=gh_token.strip(),
+        auth_alert_sent=parse_auth_alert_state(os.getenv("X_AUTH_ALERT_SENT")),
     )
 
 
@@ -389,9 +406,9 @@ async def authenticate(source_token: str) -> Any:
         except Exception as exc:
             await close_tweety_client(app)
             if attempt == 2:
-                raise MonitorError() from exc
+                raise AuthenticationError() from exc
             await asyncio.sleep(2**attempt)
-    raise MonitorError() if last_app is None else MonitorError()
+    raise AuthenticationError() if last_app is None else AuthenticationError()
 
 
 def split_iter_page(page: Any) -> tuple[Any, Any]:
@@ -608,15 +625,19 @@ async def deliver_discord(webhook: str, payload: dict[str, Any]) -> None:
     raise MonitorError()
 
 
-def update_cursor_secret(post_id: int, repository: str, gh_token: str) -> None:
+def authentication_alert_payload() -> dict[str, Any]:
+    return {"content": AUTH_ALERT_MESSAGE, "allowed_mentions": {"parse": []}}
+
+
+def update_environment_secret(secret_name: str, secret_value: str, repository: str, gh_token: str) -> None:
     env = os.environ.copy()
     env["GH_PROMPT_DISABLED"] = "1"
     env["NO_COLOR"] = "1"
     env["GH_TOKEN"] = gh_token
-    command = ["gh", "secret", "set", CURSOR_SECRET_NAME, "--env", ENVIRONMENT_NAME, "--repo", repository]
+    command = ["gh", "secret", "set", secret_name, "--env", ENVIRONMENT_NAME, "--repo", repository]
     completed = subprocess.run(
         command,
-        input=f"{post_id}\n",
+        input=f"{secret_value}\n",
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -628,9 +649,29 @@ def update_cursor_secret(post_id: int, repository: str, gh_token: str) -> None:
         raise MonitorError()
 
 
+def update_cursor_secret(post_id: int, repository: str, gh_token: str) -> None:
+    update_environment_secret(CURSOR_SECRET_NAME, str(post_id), repository, gh_token)
+
+
+def update_auth_alert_secret(state: str, repository: str, gh_token: str) -> None:
+    update_environment_secret(AUTH_ALERT_SECRET_NAME, state, repository, gh_token)
+
+
+async def handle_authentication_failure(config: Config) -> None:
+    if config.auth_alert_sent == "0":
+        await deliver_discord(config.discord_webhook, authentication_alert_payload())
+        update_auth_alert_secret("1", config.repository, config.gh_token)
+    raise AuthenticationError()
+
+
 async def process(config: Config) -> None:
-    app = await authenticate(config.source_token)
     try:
+        app = await authenticate(config.source_token)
+    except AuthenticationError:
+        await handle_authentication_failure(config)
+    try:
+        if config.auth_alert_sent == "1":
+            update_auth_alert_secret("0", config.repository, config.gh_token)
         timeline = await retrieve_timeline(app, config.monitored_account, config.cursor)
         records = timeline.records
         if config.cursor == 0:

@@ -44,6 +44,7 @@ jobs:
           X_MONITORED_ACCOUNT: ${{ secrets.X_MONITORED_ACCOUNT }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           X_POST_ID: ${{ secrets.X_POST_ID }}
+          X_AUTH_ALERT_SENT: ${{ secrets.X_AUTH_ALERT_SENT }}
           GH_TOKEN: ${{ secrets.GH_UPDATE_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python monitor.py
