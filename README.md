@@ -25,12 +25,15 @@ Create a GitHub environment named:
 monitor-state
 ```
 
-Inside that environment, create this secret:
+Inside that environment, create these secrets:
 
 * `X_POST_ID`
   Set it to `0` before the first run.
 
-`X_POST_ID` should exist only inside the `monitor-state` environment. Do not also create it as a repository secret.
+* `X_AUTH_ALERT_SENT`
+  Set it to `0` before the first run. This prevents repeated Discord warnings while the same X session cannot be authenticated.
+
+`X_POST_ID` and `X_AUTH_ALERT_SENT` should exist only inside the `monitor-state` environment. Do not also create them as repository secrets.
 
 ### Repository Secrets
 
