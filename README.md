@@ -11,6 +11,7 @@ It runs through GitHub Actions and uses a Discord webhook. No Discord bot or con
 * Skips replies, Quote Posts, reposts, and posts containing mentions
 * Prevents older posts from being sent during the first run
 * Safely recovers posts after missed checks without silently skipping them
+* Sends a generic Discord warning when the X session can no longer be authenticated
 * Keeps account names, post IDs, post links, tokens, and webhook details out of public files and logs
 * Uses locked dependency versions for consistent workflow runs
 * Supports manual runs and external scheduling through cron-job.org
@@ -49,7 +50,7 @@ Add these repository secrets:
   The webhook URL for the destination Discord channel.
 
 * `GH_UPDATE_TOKEN`
-  A fine-grained GitHub token used to update `X_POST_ID`.
+  A fine-grained GitHub token used to update the `monitor-state` environment secrets.
 
 Limit `GH_UPDATE_TOKEN` to this repository and grant it only:
 
