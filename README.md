@@ -13,7 +13,7 @@ It runs through GitHub Actions and uses a Discord webhook. No Discord bot or con
 * Safely recovers posts after missed checks without silently skipping them
 * Sends a generic Discord warning when the X session can no longer be authenticated
 * Keeps account names, post IDs, post links, tokens, and webhook details out of public files and logs
-* Uses locked dependency versions for consistent workflow runs
+* Pins direct Python dependency versions for consistent workflow runs
 * Supports manual runs and external scheduling through cron-job.org
 
 ## Setup

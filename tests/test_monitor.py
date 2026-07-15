@@ -186,5 +186,187 @@ class OutputHardeningTests(unittest.TestCase):
         self.assertEqual(captured["input"], "1\n")
 
 
+class FakeUserTweets(dict):
+    def __init__(
+        self,
+        *,
+        is_next_page: bool,
+        cursor: str | None = None,
+        pinned_tweets=None,
+        pinned=None,
+    ):
+        super().__init__(is_next_page=is_next_page, cursor=cursor)
+        self.is_next_page = is_next_page
+        self.cursor = cursor
+        if pinned_tweets is not None:
+            self["pinned_tweets"] = pinned_tweets
+            self.pinned_tweets = pinned_tweets
+        if pinned is not None:
+            self["pinned"] = pinned
+            self.pinned = pinned
+
+
+class FakeAuthor:
+    username = "syntheticacct"
+    name = "Synthetic Account"
+
+
+class FakeTweet:
+    def __init__(self, post_id: int, text: str | None = None):
+        self.id = str(post_id)
+        self.author = FakeAuthor()
+        self.full_text = text or f"synthetic post {post_id}"
+        self.is_reply = False
+        self.is_quoted = False
+        self.is_retweet = False
+        self.user_mentions = []
+
+
+class FakeSelfThread:
+    def __init__(self, tweets):
+        self.tweets = tweets
+
+
+class FakeApp:
+    def __init__(self, pages):
+        self.pages = pages
+
+    async def iter_tweets(self, *args, **kwargs):
+        for page in self.pages:
+            yield page
+
+
+class PaginationTests(MonitorTestCase, unittest.IsolatedAsyncioTestCase):
+    def page(self, ids, *, more: bool, cursor: str | None = None, pinned_tweets=None, pinned=None):
+        state = FakeUserTweets(is_next_page=more, cursor=cursor, pinned_tweets=pinned_tweets, pinned=pinned)
+        return state, [FakeTweet(post_id) for post_id in ids]
+
+    def raw_page(self, items, *, more: bool, cursor: str | None = None, pinned_tweets=None, pinned=None):
+        state = FakeUserTweets(is_next_page=more, cursor=cursor, pinned_tweets=pinned_tweets, pinned=pinned)
+        return state, items
+
+    async def retrieve(self, pages, cursor=100):
+        return await monitor.retrieve_timeline_once(FakeApp(pages), "syntheticacct", cursor)
+
+    async def test_retrieves_multiple_pages_when_is_next_page_is_true(self) -> None:
+        result = await self.retrieve([
+            self.page([105], more=True, cursor="page-2"),
+            self.page([104, 100], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertEqual([record.post_id for record in result.records], [100, 104, 105])
+        self.assertTrue(result.found_cursor_boundary)
+
+    async def test_stops_when_is_next_page_becomes_false(self) -> None:
+        result = await self.retrieve([
+            self.page([105], more=True),
+            self.page([104], more=False),
+            self.page([103], more=False),
+        ], cursor=100)
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertFalse(result.more_pages)
+        self.assertFalse(result.found_cursor_boundary)
+
+    async def test_finds_saved_cursor_on_later_page(self) -> None:
+        result = await self.retrieve([
+            self.page([106, 105], more=True),
+            self.page([104, 100], more=True),
+            self.page([99], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertTrue(result.more_pages)
+        self.assertTrue(result.found_cursor_boundary)
+
+    async def test_global_deduplication_and_oldest_to_newest_processing(self) -> None:
+        result = await self.retrieve([
+            self.page([104, 103], more=True),
+            self.page([105, 104, 100], more=False),
+        ])
+        self.assertEqual([record.post_id for record in result.records], [100, 103, 104, 105])
+
+    async def test_old_pinned_post_on_first_page_does_not_stop_pagination(self) -> None:
+        result = await self.retrieve([
+            self.page([100, 105], more=True, pinned_tweets=[100]),
+            self.page([104, 103], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertFalse(result.found_cursor_boundary)
+        self.assertEqual([record.post_id for record in result.records if record.post_id > 100], [103, 104, 105])
+
+    async def test_first_run_uses_single_page_for_initialization(self) -> None:
+        result = await self.retrieve([
+            self.page([105], more=True),
+            self.page([104], more=False),
+        ], cursor=0)
+        self.assertEqual(result.pages_retrieved, 1)
+        self.assertEqual([record.post_id for record in result.records], [105])
+        self.assertTrue(result.more_pages)
+
+    async def test_max_timeline_pages_fail_closed_when_boundary_not_proven(self) -> None:
+        pages = [self.page([200 + index], more=True) for index in range(monitor.MAX_TIMELINE_PAGES)]
+        with self.assertRaises(monitor.MonitorError):
+            await self.retrieve(pages, cursor=100)
+
+    async def test_no_discord_delivery_or_cursor_update_after_incomplete_recovery(self) -> None:
+        pages = [self.page([200 + index], more=True) for index in range(monitor.MAX_TIMELINE_PAGES)]
+        app = FakeApp(pages)
+        with mock.patch.object(monitor, "authenticate", mock.AsyncMock(return_value=app)):
+            with mock.patch.object(monitor, "deliver_discord", mock.AsyncMock()) as deliver:
+                with mock.patch.object(monitor, "update_cursor_secret") as update_cursor:
+                    with mock.patch.object(monitor, "close_tweety_client", mock.AsyncMock()):
+                        with self.assertRaises(monitor.MonitorError):
+                            await monitor.process(self.make_config("0", cursor=100))
+        deliver.assert_not_awaited()
+        update_cursor.assert_not_called()
+
+    async def test_excluded_posts_still_advance_cursor_after_complete_recovery(self) -> None:
+        excluded = FakeTweet(101, "hello @someone")
+        included = FakeTweet(102, "hello world")
+        app = FakeApp([(FakeUserTweets(is_next_page=False, cursor=None), [included, excluded, FakeTweet(100)])])
+        updates = []
+        deliveries = []
+        with mock.patch.object(monitor, "authenticate", mock.AsyncMock(return_value=app)):
+            with mock.patch.object(monitor, "deliver_discord", mock.AsyncMock(side_effect=lambda webhook, payload: deliveries.append(payload))):
+                with mock.patch.object(monitor, "update_cursor_secret", side_effect=lambda post_id, repo, token: updates.append(post_id)):
+                    with mock.patch.object(monitor, "close_tweety_client", mock.AsyncMock()):
+                        await monitor.process(self.make_config("0", cursor=100))
+        self.assertEqual(updates, [101, 102])
+        self.assertEqual(len(deliveries), 1)
+
+    async def test_nested_thread_cursor_does_not_stop_before_later_unseen_posts(self) -> None:
+        result = await self.retrieve([
+            self.raw_page([FakeSelfThread([FakeTweet(105), FakeTweet(100)])], more=True),
+            self.page([104, 103], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertEqual([record.post_id for record in result.records], [100, 103, 104, 105])
+        self.assertFalse(result.found_cursor_boundary)
+
+    async def test_nested_cursor_on_fifth_page_with_more_pages_fails_closed(self) -> None:
+        pages = [self.page([200 + index], more=True) for index in range(monitor.MAX_TIMELINE_PAGES - 1)]
+        pages.append(self.raw_page([FakeSelfThread([FakeTweet(105), FakeTweet(100)])], more=True))
+        with self.assertRaises(monitor.MonitorError):
+            await self.retrieve(pages, cursor=100)
+
+    async def test_direct_top_level_cursor_on_later_page_proves_boundary(self) -> None:
+        result = await self.retrieve([
+            self.raw_page([FakeSelfThread([FakeTweet(105), FakeTweet(100)])], more=True),
+            self.page([104, 100], more=True),
+            self.page([99], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertTrue(result.found_cursor_boundary)
+        self.assertEqual([record.post_id for record in result.records], [100, 104, 105])
+
+    async def test_singular_pinned_attribute_does_not_prove_boundary(self) -> None:
+        result = await self.retrieve([
+            self.page([100, 105], more=True, pinned=FakeTweet(100)),
+            self.page([104, 103], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertFalse(result.found_cursor_boundary)
+        self.assertEqual([record.post_id for record in result.records if record.post_id > 100], [103, 104, 105])
+
+
 if __name__ == "__main__":
     unittest.main()
