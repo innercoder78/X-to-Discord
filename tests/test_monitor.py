@@ -187,13 +187,23 @@ class OutputHardeningTests(unittest.TestCase):
 
 
 class FakeUserTweets(dict):
-    def __init__(self, *, is_next_page: bool, cursor: str | None = None, pinned_tweets=None):
+    def __init__(
+        self,
+        *,
+        is_next_page: bool,
+        cursor: str | None = None,
+        pinned_tweets=None,
+        pinned=None,
+    ):
         super().__init__(is_next_page=is_next_page, cursor=cursor)
         self.is_next_page = is_next_page
         self.cursor = cursor
         if pinned_tweets is not None:
             self["pinned_tweets"] = pinned_tweets
             self.pinned_tweets = pinned_tweets
+        if pinned is not None:
+            self["pinned"] = pinned
+            self.pinned = pinned
 
 
 class FakeAuthor:
@@ -212,6 +222,11 @@ class FakeTweet:
         self.user_mentions = []
 
 
+class FakeSelfThread:
+    def __init__(self, tweets):
+        self.tweets = tweets
+
+
 class FakeApp:
     def __init__(self, pages):
         self.pages = pages
@@ -222,9 +237,13 @@ class FakeApp:
 
 
 class PaginationTests(MonitorTestCase, unittest.IsolatedAsyncioTestCase):
-    def page(self, ids, *, more: bool, cursor: str | None = None, pinned_tweets=None):
-        state = FakeUserTweets(is_next_page=more, cursor=cursor, pinned_tweets=pinned_tweets)
+    def page(self, ids, *, more: bool, cursor: str | None = None, pinned_tweets=None, pinned=None):
+        state = FakeUserTweets(is_next_page=more, cursor=cursor, pinned_tweets=pinned_tweets, pinned=pinned)
         return state, [FakeTweet(post_id) for post_id in ids]
+
+    def raw_page(self, items, *, more: bool, cursor: str | None = None, pinned_tweets=None, pinned=None):
+        state = FakeUserTweets(is_next_page=more, cursor=cursor, pinned_tweets=pinned_tweets, pinned=pinned)
+        return state, items
 
     async def retrieve(self, pages, cursor=100):
         return await monitor.retrieve_timeline_once(FakeApp(pages), "syntheticacct", cursor)
@@ -313,6 +332,40 @@ class PaginationTests(MonitorTestCase, unittest.IsolatedAsyncioTestCase):
                         await monitor.process(self.make_config("0", cursor=100))
         self.assertEqual(updates, [101, 102])
         self.assertEqual(len(deliveries), 1)
+
+    async def test_nested_thread_cursor_does_not_stop_before_later_unseen_posts(self) -> None:
+        result = await self.retrieve([
+            self.raw_page([FakeSelfThread([FakeTweet(105), FakeTweet(100)])], more=True),
+            self.page([104, 103], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertEqual([record.post_id for record in result.records], [100, 103, 104, 105])
+        self.assertFalse(result.found_cursor_boundary)
+
+    async def test_nested_cursor_on_fifth_page_with_more_pages_fails_closed(self) -> None:
+        pages = [self.page([200 + index], more=True) for index in range(monitor.MAX_TIMELINE_PAGES - 1)]
+        pages.append(self.raw_page([FakeSelfThread([FakeTweet(105), FakeTweet(100)])], more=True))
+        with self.assertRaises(monitor.MonitorError):
+            await self.retrieve(pages, cursor=100)
+
+    async def test_direct_top_level_cursor_on_later_page_proves_boundary(self) -> None:
+        result = await self.retrieve([
+            self.raw_page([FakeSelfThread([FakeTweet(105), FakeTweet(100)])], more=True),
+            self.page([104, 100], more=True),
+            self.page([99], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertTrue(result.found_cursor_boundary)
+        self.assertEqual([record.post_id for record in result.records], [100, 104, 105])
+
+    async def test_singular_pinned_attribute_does_not_prove_boundary(self) -> None:
+        result = await self.retrieve([
+            self.page([100, 105], more=True, pinned=FakeTweet(100)),
+            self.page([104, 103], more=False),
+        ])
+        self.assertEqual(result.pages_retrieved, 2)
+        self.assertFalse(result.found_cursor_boundary)
+        self.assertEqual([record.post_id for record in result.records if record.post_id > 100], [103, 104, 105])
 
 
 if __name__ == "__main__":

@@ -445,6 +445,20 @@ def page_has_more(page_state: Any) -> bool:
     return False
 
 
+def direct_top_level_post_ids(items: Any, monitored_handle: str) -> set[int]:
+    post_ids: set[int] = set()
+    iterable = items if isinstance(items, (list, tuple)) else list(items or [])
+    for item in iterable:
+        post_id = get_post_id(item)
+        if post_id is None:
+            continue
+        handle = author_handle(item)
+        if handle is None or handle.lower() != monitored_handle.lower():
+            continue
+        post_ids.add(post_id)
+    return post_ids
+
+
 def pinned_post_ids(page_state: Any) -> set[int]:
     pinned_ids: set[int] = set()
     for name in ("pinned_tweets", "pinned", "pinned_tweet"):
@@ -473,11 +487,11 @@ async def retrieve_timeline_once(app: Any, monitored_account: str, cursor: int) 
         page_state, page_items = split_iter_page(page)
         more_pages = page_has_more(page_state)
         page_records = build_records(page_items, monitored_account)
-        pinned_ids = pinned_post_ids(page_state)
+        boundary_ids = direct_top_level_post_ids(page_items, monitored_account) - pinned_post_ids(page_state)
         for record in page_records:
             records.setdefault(record.post_id, record)
-            if cursor > 0 and record.post_id == cursor and record.post_id not in pinned_ids:
-                found_cursor_boundary = True
+        if cursor > 0 and cursor in boundary_ids:
+            found_cursor_boundary = True
         if cursor > 0 and (found_cursor_boundary or not more_pages or pages_retrieved >= MAX_TIMELINE_PAGES):
             break
         if cursor == 0:
