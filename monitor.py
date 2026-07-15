@@ -420,21 +420,45 @@ def split_iter_page(page: Any) -> tuple[Any, Any]:
     return None, page
 
 
+def page_state_value(page_state: Any, name: str) -> Any:
+    try:
+        value = getattr(page_state, name)
+    except Exception:
+        value = None
+    if value is not None:
+        return value
+    if isinstance(page_state, dict):
+        return page_state.get(name)
+    return None
+
+
 def page_has_more(page_state: Any) -> bool:
+    is_next_page = page_state_value(page_state, "is_next_page")
+    if isinstance(is_next_page, bool):
+        return is_next_page
     for name in ("has_next_page", "has_next", "has_more", "more", "next_cursor"):
-        value = getattr(page_state, name, None)
+        value = page_state_value(page_state, name)
         if isinstance(value, bool):
             return value
         if meaningful(value):
             return True
-    if isinstance(page_state, dict):
-        for name in ("has_next_page", "has_next", "has_more", "more", "next_cursor"):
-            value = page_state.get(name)
-            if isinstance(value, bool):
-                return value
-            if meaningful(value):
-                return True
     return False
+
+
+def pinned_post_ids(page_state: Any) -> set[int]:
+    pinned_ids: set[int] = set()
+    for name in ("pinned_tweets", "pinned", "pinned_tweet"):
+        value = page_state_value(page_state, name)
+        if value is None:
+            continue
+        items = value if isinstance(value, (list, tuple, set, frozenset)) else (value,)
+        for item in items:
+            post_id = parse_positive_decimal(item)
+            if post_id is None:
+                post_id = get_post_id(item)
+            if post_id is not None:
+                pinned_ids.add(post_id)
+    return pinned_ids
 
 
 async def retrieve_timeline_once(app: Any, monitored_account: str, cursor: int) -> TimelineResult:
@@ -449,9 +473,10 @@ async def retrieve_timeline_once(app: Any, monitored_account: str, cursor: int) 
         page_state, page_items = split_iter_page(page)
         more_pages = page_has_more(page_state)
         page_records = build_records(page_items, monitored_account)
+        pinned_ids = pinned_post_ids(page_state)
         for record in page_records:
             records.setdefault(record.post_id, record)
-            if cursor > 0 and record.post_id <= cursor:
+            if cursor > 0 and record.post_id == cursor and record.post_id not in pinned_ids:
                 found_cursor_boundary = True
         if cursor > 0 and (found_cursor_boundary or not more_pages or pages_retrieved >= MAX_TIMELINE_PAGES):
             break
@@ -463,7 +488,7 @@ async def retrieve_timeline_once(app: Any, monitored_account: str, cursor: int) 
         cursor > 0
         and pages_retrieved >= MAX_TIMELINE_PAGES
         and more_pages
-        and all(record.post_id > cursor for record in sorted_records)
+        and not found_cursor_boundary
     ):
         raise MonitorError()
     return TimelineResult(sorted_records, pages_retrieved, more_pages, found_cursor_boundary)
