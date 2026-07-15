@@ -4,6 +4,8 @@ X to Discord watches one X account and sends its new posts to a Discord channel.
 
 It runs through GitHub Actions and uses a Discord webhook. No Discord bot or continuously running server is needed.
 
+THIS IS A THEORETICAL PROJECT. Considering the only way to test this would most likely get your account banned from X for scraping, this is just something to think about in case they ever stop being so stingy and allow people to scrape for posts again or make the API free.
+
 ## Features
 
 * Sends posts in the order they were published
@@ -11,9 +13,12 @@ It runs through GitHub Actions and uses a Discord webhook. No Discord bot or con
 * Skips replies, Quote Posts, reposts, and posts containing mentions
 * Prevents older posts from being sent during the first run
 * Safely recovers posts after missed checks without silently skipping them
+* Prevents pinned posts and posts nested inside thread groups from prematurely stopping timeline recovery
+* Stops without sending posts or advancing the saved post ID when complete recovery cannot be confirmed
 * Sends a generic Discord warning when the X session can no longer be authenticated
 * Keeps account names, post IDs, post links, tokens, and webhook details out of public files and logs
 * Pins direct Python dependency versions for consistent workflow runs
+* Runs automated tests and Python compilation checks through GitHub Actions
 * Supports manual runs and external scheduling through cron-job.org
 
 ## Setup
@@ -70,7 +75,15 @@ The workflow itself does not use GitHub’s scheduled workflow feature.
 
 On the first run, the monitor remembers the newest available post without sending older posts. Future runs send only qualifying posts published after that point.
 
-If several checks are missed, the monitor searches additional timeline pages. It stops safely rather than advancing the saved post ID when it cannot confirm that every unseen post was recovered.
+If several checks are missed, the monitor searches additional timeline pages. It uses direct, non-pinned timeline posts to confirm that it has reached the previously saved post. Posts nested inside thread groups are still processed, but they do not prematurely stop the recovery search.
+
+If the monitor reaches its recovery limit while additional pages remain, it stops safely without sending Discord messages or advancing the saved post ID.
+
+## Testing
+
+A separate GitHub Actions workflow runs automatically for pushes and pull requests.
+
+It installs the project dependencies, runs the unit tests, and checks that the Python files compile successfully. The testing workflow does not use the repository or environment secrets required by the monitor.
 
 ## Privacy
 
